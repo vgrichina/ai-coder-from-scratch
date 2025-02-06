@@ -1,0 +1,5 @@
+Generate complete Node.js code based on this request:
+
+{{USER_REQUEST}}
+
+Show the complete code between triple backticks.
