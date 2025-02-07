@@ -1,1 +1,14 @@
-Check the existing coder implementation for any mistakes and suggest fixes
+Start response with very laconic one line overview of changes done.
+
+Let's think how to refactor coder to introduce new features:
+- REPL command
+    - should take list of files like other commands, but also allow to add/drop them interactively
+    - use commands like /commit
+    - keep conversation history and include it in LLM request
+- streaming LLM response
+    - needs to abort request on Ctrl-C, don't crash whole program
+- improved commit message generation (run another query with LLM, just feed it user prompt + `git show`)
+- don't use external files for prompt templates 
+- make sure that when commiting:
+    - the changes are applied to correct files (filename parsed from response)
+    - new files created if necessary
