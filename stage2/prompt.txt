@@ -5,8 +5,11 @@ Let's think how to refactor coder to introduce new features:
     - should take list of files like other commands, but also allow to add/drop them interactively
     - use commands like /commit
     - keep conversation history and include it in LLM request
+    - /run command should execute given command; include both command and output in chat history
+    - use colors (ansi codes directly, avoid chalk)
 - streaming LLM response
     - needs to abort request on Ctrl-C, don't crash whole program
+    - beware of [DONE]
 - improved commit message generation (run another query with LLM, just feed it user prompt + `git show`)
 - don't use external files for prompt templates 
 - make sure that when commiting:
