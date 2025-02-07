@@ -45,9 +45,9 @@ process.stdin.on('end', async () => {
                 const response = JSON.parse(data);
                 const code = response.choices[0].message.content;
                 // Extract code between triple backticks
-                const match = code.match(/```(?:javascript|js)?\n([\s\S]*?)```/);
+                const match = code.match(/```(?:javascript|js)?\n([\s\S]*?)\n```\s*$/m);
                 if (match) {
-                    console.log(match[1]);
+                    console.log(match[1].trimEnd());
                 } else {
                     console.error('No code found in response');
                 }
