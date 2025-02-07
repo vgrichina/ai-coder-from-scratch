@@ -1,214 +1,274 @@
 const fs = require('fs');
-const path = require('path');
-const http = require('http');
-const EventSource = require('eventsource');
+const https = require('https');
+const readline = require('readline');
+const util = require('util');
+const child_process = require('child_process');
+const debug = require('debug')('ai-coder');
 
-const API_KEY = process.env.OPENROUTER_API_KEY || '';
-const API_URL = 'https://openrouter.ai/api/v1/chat/completions';
-
-let chatHistory = [];
-let filesData = {};
-let isInteractive = false;
-
-function logError(err) {
-  console.error(err);
-}
-
-function handleApiResponse(res) {
-  let data = '';
-  const stream = new EventSource(res.body);
-
-  stream.onerror = (err) => {
-    logError(err);
-    stream.close();
-  };
-
-  stream.onmessage = (msg) => {
-    const lines = msg.data.split('\n').slice(1, -1);
-    for (const line of lines) {
-      const token = line.slice(6);
-      data += token;
-      process.stdout.write(token);
-    }
-  };
-
-  stream.onopen = () => {
-    console.log('Received API response stream');
-  };
-
-  stream.onclose = () => {
-    handleApiData(data);
-    isInteractive = true;
-    printPrompt();
-  };
-}
-
-function handleApiData(data) {
-  try {
-    const resp = JSON.parse(data);
-    const output = resp.output.trim();
-    chatHistory.push({ role: 'user', content: resp.prompt });
-    chatHistory.push({ role: 'assistant', content: output });
-
-    if (output.startsWith('```')) {
-      const filename = output.split('\n')[0].replace(/```/, '').trim();
-      const content = output.split('```')[2];
-      filesData[filename] = content;
-    } else {
-      const commitMessage = parseCommitMessage(output);
-      if (commitMessage) {
-        commitChanges(commitMessage);
-      }
-    }
-  } catch (err) {
-    logError(err);
-  }
-}
-
-function parseCommitMessage(text) {
-  const msgPattern = /^(?:feat|fix|chore|docs|test|refactor)\([a-z]+\):\s*(.+)/i;
-  const match = text.trim().match(msgPattern);
-  return match ? match[1] : null;
-}
-
-function printFiles() {
-  for (const [filename, content] of Object.entries(filesData)) {
-    console.log(`\n${filename}\n${content.trim()}`);
-  }
-}
-
-function commitChanges(message) {
-  console.log(`\nCommit: ${message}`);
-  printFiles();
-}
-
-function handleCommand(cmd) {
-  const [action, arg] = cmd.split(' ');
-  switch (action) {
-    case '/ask':
-      chatHistory.push({ role: 'user', content: arg });
-      sendRequestToApi();
-      break;
-    case '/add':
-      filesData[arg] = '';
-      break;
-    case '/drop':
-      delete filesData[arg];
-      break;
-    case '/commit':
-      commitChanges('Code changes');
-      break;
-    case '/undo':
-      console.log('Undo not implemented');
-      break;
-    case '/run':
-      console.log('Execute:', arg);
-      break;
-    case '/help':
-      printHelp();
-      break;
-    default:
-      chatHistory.push({ role: 'user', content: cmd });
-      sendRequestToApi();
-  }
-}
-
-function printHelp() {
-  const helpText = `
-Interactive Mode Commands:
-/ask <question>  Ask about code  
-/add <file>      Add file to context
-/drop <file>     Remove file
-/commit          Create git commit 
-/undo            Revert last change
-/run <cmd>       Execute shell command
-/help            Show this help
-`;
-  console.log(helpText.trim());
-}
-
-function printPrompt() {
-  process.stdout.write('ai-coder> ');
-}
-
-
-function sendRequestToApi() {
-  const body = JSON.stringify({
-    prompt: chatHistory.map(({ content }) => content).join('\n\n'),
-    options: {
-      model: 'code-davinci-002',
-      maxTokens: 3000,
-      temperature: 0,
-      topP: 1,
-      stream: true,
-    },
-  });
-
-  const headers = {
-    'Content-Type': 'application/json',
-    Authorization: `Bearer ${API_KEY}`,
-  };
-
-  const req = http.request(
-    API_URL,
-    {
-      method: 'POST',
-      headers,
-    },
-    (res) => {
-      if (res.statusCode === 200) {
-        handleApiResponse(res);
-      } else {
-        const err = new Error(`API request failed with status ${res.statusCode}`);
-        logError(err);
-        printPrompt();
-      }
-    }
-  );
-
-  req.on('error', (err) => {
-    logError(err);
-    printPrompt();
-  });
-
-  req.write(body);
-  req.end();
-}
-
-function interactiveMode() {
-  isInteractive = true;
-  printPrompt();
-
-  const stdin = process.openStdin();
-  stdin.addListener('data', (chunk) => {
-    const cmd = chunk.toString().trim();
-    if (cmd) {
-      handleCommand(cmd);
-    } else {
-      printPrompt();
-    }
-  });
-}
-
-function cliMode(prompt) {
-  chatHistory.push({ role: 'user', content: prompt });
-  sendRequestToApi();
-}
-
-function main() {
-  const args = process.argv.slice(2);
-  const options = args.filter((arg) => arg.startsWith('-'));
-  const prompt = args.filter((arg) => !arg.startsWith('-')).join(' ');
-
-  if (options.includes('-i') || options.includes('--interactive')) {
-    interactiveMode();
-  } else if (prompt) {
-    cliMode(prompt);
-  } else {
-    console.error('Error: Missing prompt');
-    printHelp();
+const API_KEY = process.env.OPENROUTER_API_KEY;
+if (!API_KEY) {
+    console.error('Please set OPENROUTER_API_KEY environment variable');
     process.exit(1);
-  }
 }
 
-main();
+const API_URL = 'https://openrouter.ai/api/v1/chat/completions';
+const MODEL = 'anthropic/claude-3.5-sonnet';
+
+let fileContent = {};
+let conversation = [];
+let commitMessages = [];
+
+const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    prompt: 'ai-coder> '
+});
+
+rl.on('line', async (line) => {
+    if (line.startsWith('/')) {
+        await handleCommand(line);
+    } else {
+        await handleCoding(line);
+    }
+    rl.prompt();
+});
+
+async function handleCommand(line) {
+    const [command, ...args] = line.slice(1).split(' ');
+    switch (command) {
+        case 'ask':
+            const question = args.join(' ');
+            await askQuestion(question);
+            break;
+        case 'add':
+            const filename = args[0];
+            await addFile(filename);
+            break;
+        case 'drop':
+            const fileToRemove = args[0];
+            await removeFile(fileToRemove);
+            break;
+        case 'commit':
+            await commit();
+            break;
+        case 'undo':
+            await undo();
+            break;
+        case 'run':
+            const cmd = args.join(' ');
+            await runCommand(cmd);
+            break;
+        case 'help':
+            showHelp();
+            break;
+        default:
+            console.log(`Unknown command: ${command}`);
+    }
+}
+
+async function handleCoding(prompt) {
+    const systemPrompt = fs.readFileSync(__dirname + '/system_prompt.txt', 'utf8');
+    const userPrompt = `${prompt}\n\nFiles:\n${Object.entries(fileContent).map(([filename, content]) => `${filename}\n\`\`\`\n${content}\n\`\`\``).join('\n')}`;
+    const messages = [
+        { role: 'system', content: systemPrompt },
+        ...conversation,
+        { role: 'user', content: userPrompt }
+    ];
+
+    debug('>>> GPT\n', systemPrompt, '\n', userPrompt);
+
+    try {
+        const response = await makeAPIRequest(messages);
+        const code = response.choices[0].message.content;
+        debug('<<< GPT\n', code);
+
+        const codeBlocks = extractCodeBlocks(code);
+        for (const { filename, content } of codeBlocks) {
+            fileContent[filename] = content;
+            console.log(`${filename}\n\`\`\`\n${content}\n\`\`\``);
+        }
+
+        conversation.push({ role: 'user', content: userPrompt }, { role: 'assistant', content: code });
+    } catch (err) {
+        console.error('Error:', err);
+    }
+}
+
+async function askQuestion(question) {
+    const systemPrompt = fs.readFileSync(__dirname + '/system_prompt.txt', 'utf8');
+    const userPrompt = `I have a question: ${question}`;
+    const messages = [
+        { role: 'system', content: systemPrompt },
+        ...conversation,
+        { role: 'user', content: userPrompt }
+    ];
+
+    debug('>>> GPT\n', systemPrompt, '\n', userPrompt);
+
+    try {
+        const response = await makeAPIRequest(messages);
+        const answer = response.choices[0].message.content;
+        debug('<<< GPT\n', answer);
+        console.log(answer);
+        conversation.push({ role: 'user', content: userPrompt }, { role: 'assistant', content: answer });
+    } catch (err) {
+        console.error('Error:', err);
+    }
+}
+
+async function addFile(filename) {
+    try {
+        const content = fs.readFileSync(filename, 'utf8');
+        fileContent[filename] = content;
+        console.log(`Added ${filename}`);
+    } catch (err) {
+        console.error(`Error adding ${filename}:`, err);
+    }
+}
+
+async function removeFile(filename) {
+    try {
+        delete fileContent[filename];
+        console.log(`Removed ${filename}`);
+    } catch (err) {
+        console.error(`Error removing ${filename}:`, err);
+    }
+}
+
+async function commit() {
+    const commitMessage = `
+${commitMessages.join('\n')}
+
+Changes:
+${Object.entries(fileContent).map(([filename, content]) => `- ${filename}: ${getDiffSummary(filename, content)}`).join('\n')}
+`.trim();
+
+    const gitignore = fs.existsSync('.gitignore') ? fs.readFileSync('.gitignore', 'utf8') : '';
+    const filesToCommit = Object.keys(fileContent).filter(file => !gitignore.includes(file));
+
+    if (filesToCommit.length === 0) {
+        console.log('No changes to commit');
+        return;
+    }
+
+    for (const file of filesToCommit) {
+        fs.writeFileSync(file, fileContent[file]);
+    }
+
+    const gitCommit = util.promisify(child_process.exec);
+    try {
+        await gitCommit(`git add ${filesToCommit.join(' ')}`);
+        await gitCommit(`git commit -m "${commitMessage.replace(/"/g, '\\"')}"`);
+        console.log('Changes committed');
+        commitMessages = [];
+    } catch (err) {
+        console.error('Error committing changes:', err);
+    }
+}
+
+function getDiffSummary(filename, newContent) {
+    try {
+        const oldContent = fs.readFileSync(filename, 'utf8');
+        const diff = require('diff').createPatch(filename, oldContent, newContent);
+        const diffLines = diff.split('\n').slice(5, 10);
+        return diffLines.join('\n');
+    } catch (err) {
+        return 'New file';
+    }
+}
+
+async function undo() {
+    const gitReset = util.promisify(child_process.exec);
+    try {
+        await gitReset('git reset --hard');
+        console.log('Changes reverted');
+        fileContent = {};
+    } catch (err) {
+        console.error('Error reverting changes:', err);
+    }
+}
+
+async function runCommand(cmd) {
+    const exec = util.promisify(child_process.exec);
+    try {
+        const { stdout, stderr } = await exec(cmd);
+        console.log(stdout.trim());
+        if (stderr) {
+            console.error(stderr.trim());
+        }
+    } catch (err) {
+        console.error('Error running command:', err);
+    }
+}
+
+function showHelp() {
+    const help = `
+Commands:
+
+    /ask <question>  Ask about code
+    /add <file>      Add file to context
+    /drop <file>     Remove file
+    /commit          Create git commit
+    /undo            Revert last change
+    /run <cmd>       Execute shell command
+    /help            Show this help
+
+When no slash prefix, interpret as coding prompt
+`;
+    console.log(help);
+}
+
+async function makeAPIRequest(messages) {
+    const requestData = {
+        model: MODEL,
+        messages,
+        stream: false
+    };
+
+    const options = {
+        hostname: 'openrouter.ai',
+        path: '/api/v1/chat/completions',
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${API_KEY}`
+        }
+    };
+
+    return new Promise((resolve, reject) => {
+        const req = https.request(options, res => {
+            let data = '';
+            res.on('data', chunk => { data += chunk; });
+            res.on('end', () => {
+                try {
+                    const response = JSON.parse(data);
+                    resolve(response);
+                } catch (err) {
+                    reject(err);
+                }
+            });
+        });
+
+        req.on('error', error => {
+            reject(error);
+        });
+
+        req.write(JSON.stringify(requestData));
+        req.end();
+    });
+}
+
+function extractCodeBlocks(text) {
+    const codeBlocks = [];
+    const codeBlockRegex = /```(?:js|javascript)?\n([\s\S]*?)\n```\s*(?=\n|$)/g;
+    let match;
+    while ((match = codeBlockRegex.exec(text)) !== null) {
+        const [_, content] = match;
+        const filename = content.split('\n')[0].trim();
+        codeBlocks.push({ filename, content: content.split('\n').slice(1).join('\n').trim() });
+    }
+    return codeBlocks;
+}
+
+console.log('Interactive coding assistant started');
+rl.prompt();
