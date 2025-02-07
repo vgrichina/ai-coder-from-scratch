@@ -1,0 +1,121 @@
+# Structure
+
+Files shown as:
+```md
+filename.ext
+[content]
+```
+
+Git commits:
+```md
+feat(scope): summary
+
+Original prompt:
+<prompt>
+
+Changes:
+- file1: change
+- file2: change
+```
+
+# Commands
+
+## Interactive Mode
+```md
+/ask <question>  Ask about code
+/add <file>      Add file to context
+/drop <file>     Remove file
+/commit          Create git commit
+/undo            Revert last change
+/run <cmd>       Execute shell command
+/help            Show this help
+```
+
+When no slash prefix, interpret as coding prompt
+
+Shell-like prompt shown when ready: `ai-coder> `
+
+## CLI Mode
+```md
+ai-coder [options] <prompt>
+  -k, --key <key>        API key (default: $OPENROUTER_API_KEY)
+  -u, --url <url>        API URL (default: https://openrouter.ai/api/v1/chat/completions)
+  -i, --interactive      Start interactive mode
+  -h, --help            Show this help
+```
+
+# Implementation Details
+
+Streaming:
+- Use native fetch() with SSE
+- Process tokens as they arrive
+- No npm dependencies
+- No http/https modules
+- No import syntax (old-school Node.js)
+- Node.js 18+ required
+
+Error Handling:
+- Log all errors with stack traces
+- Show user-friendly messages
+- Include request/response details
+
+Chat History:
+- Track conversation
+- Include history in API calls
+- Store shell command outputs
+
+File Management:
+- Create/update multiple files
+- Track file dependencies
+- Handle file removals
+- Support .gitignore
+
+# Key Requirements
+
+1. Never use unescaped triple backticks in code
+2. Extract filenames reliably
+3. Create proper commit messages
+4. Stream API responses
+5. Handle errors gracefully
+6. Support all bootstrap features
+7. Maintain chat context
+
+# Prompting Templates
+
+System:
+```md
+Expert developer assistant. Edit code files with complete content.
+Follow file format:
+filename.ext
+[content]
+Never use ellipsis or partial files.
+Ask if unclear.
+```
+
+File Request:
+```md 
+Show complete content of [filename]
+```
+
+# Example Usage
+
+Interactive:
+```md
+$ ai-coder -i
+ai-coder> Create a simple web server
+[generates server.js]
+ai-coder> /add package.json
+[adds file]
+ai-coder> Add error handling
+[updates files]
+ai-coder> /commit
+[creates commit]
+```
+
+CLI:
+```md
+$ ai-coder "Create React component"
+[generates files]
+```
+
+Reply "Understood." to confirm.
