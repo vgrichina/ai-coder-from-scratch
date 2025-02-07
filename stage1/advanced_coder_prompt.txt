@@ -12,8 +12,8 @@ ai-coder [options] <command>
   -h, --help                 Show this help
 
 Commands:
-    ask [file1] [file2] [fileN]             Ask about code (just show LLM response)
-    commit [file1] [file2] [fileN]          Create git commit based on given prompt
+    ask [file1] [file2] [fileN]             Ask about code (just show LLM response). Files are provided to LLM as a context.
+    commit [file1] [file2] [fileN]          Create git commit based on given prompt. Files are provided to LLM as a context and then edited.
 
 Prompt needs to be provided in stdin like:
 
@@ -47,14 +47,17 @@ Error Handling:
 - Include request/response details
 
 Debugging:
-- Use `debug` npm package to output debugging logs at important parts like I/O
+- Use `debug` npm package to output debugging logs at important parts like what message is sent/received from LLM
 
 Prompt files:
-- Make sure to use prompt files in the same __direname as generated module.
+- Make sure to use prompt files in the same __dirname as generated module.
+- Replace {{USER_REQUEST}} with prompt given in stdin
+- Replace {{FILES}} with full content (and names) of files being edited
 
 Git:
 
 - Use external `git` process
+- Provide commit message via stdin `git commit -a -F -`
 - Git commit template:
 
 ```
@@ -62,7 +65,7 @@ Git:
 
 Original prompt:
 
-<prompt>
+<prompt as given by user, don't include template and edited files>
 
 ```
 
