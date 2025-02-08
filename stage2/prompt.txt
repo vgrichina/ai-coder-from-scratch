@@ -8,10 +8,13 @@ Let's think how to refactor coder to introduce new features:
     - /run command should execute given command; include both command and output in chat history
     - use colors (ansi codes directly, avoid chalk)
 - streaming LLM response
-    - needs to abort request on Ctrl-C, don't crash whole program
+    - needs to abort the current request on Ctrl-C, don't crash whole program
     - beware of [DONE]
-- improved commit message generation (run another query with LLM, just feed it user prompt + `git show`)
+    - don't accept new commands before receiving full response
 - don't use external files for prompt templates 
 - make sure that when commiting:
+    - first add files using `git add`
     - the changes are applied to correct files (filename parsed from response)
-    - new files created if necessary
+    - newly created files are supported
+    - commit message generated (run another query with LLM, just feed it user prompt + `git diff HEAD`)
+
