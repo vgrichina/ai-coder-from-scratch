@@ -4,27 +4,12 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 const { spawn } = require('child_process');
-const debug = require('debug')('ai-coder');
 const readline = require('readline');
+const debug = require('debug')('ai-coder');
 
 const API_KEY = process.env.OPENROUTER_API_KEY;
 const API_URL = process.env.OPENROUTER_API_URL || 'https://openrouter.ai/api/v1/chat/completions';
 const MODEL_NAME = process.env.OPENROUTER_MODEL_NAME || 'anthropic/claude-3.5-sonnet';
-
-const SYSTEM_PROMPT = `Act as an expert developer. You will help modify code files.
-When editing files, always show the complete file content like this:
-
-filename.py
-\`\`\`
-def hello():
-    print("hello world")
-\`\`\`
-
-Rules:
-- Show the filename alone on a line
-- Show complete file content between \`\`\` marks
-- Never use ... or partial files
-- Ask questions if the request is unclear`;
 
 // ANSI color codes
 const colors = {
@@ -37,111 +22,16 @@ const colors = {
     blue: '\x1b[34m',
     magenta: '\x1b[35m',
     cyan: '\x1b[36m',
-    white: '\x1b[37m'
 };
 
-const displayHelpAndExit = () => {
-    console.log(`
-ai-coder [options] <command>
-  -k, --key <key>            API key (default: $OPENROUTER_API_KEY)
-  -u, --url <url>            API URL (default: ${API_URL})
-  -m, --model <model_name>   LLM model name (default: ${MODEL_NAME})
-  -h, --help                 Show this help
-
-Commands:
-    ask [file1] [file2] [fileN]             Ask about code (just show LLM response). Files are provided to LLM as a context.
-    commit [file1] [file2] [fileN]          Create git commit based on given prompt. Files are provided to LLM as a context and then edited.
-    repl [file1] [file2] [fileN]            Start interactive REPL session with file context.
-
-Commands in REPL mode:
-    /help                    Show this help
-    /add <file>             Add file to context
-    /drop <file>            Remove file from context
-    /files                  List current files in context
-    /commit                 Commit changes to files
-    /run <command>          Execute shell command
-    /exit                   Exit REPL
-`);
-    process.exit(0);
-};
-
-class LLMClient {
+class Coder {
     constructor(apiKey, apiUrl, model) {
         this.apiKey = apiKey;
         this.apiUrl = apiUrl;
         this.model = model;
-        this.currentRequest = null;
-    }
-
-    async makeRequest(messages, onChunk) {
-        const options = {
-            hostname: new URL(this.apiUrl).hostname,
-            path: new URL(this.apiUrl).pathname,
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${this.apiKey}`
-            }
-        };
-
-        return new Promise((resolve, reject) => {
-            let response = '';
-            
-            this.currentRequest = https.request(options, res => {
-                res.on('data', chunk => {
-                    const lines = chunk.toString().split('\n').filter(line => line.trim());
-                    for (const line of lines) {
-                        if (line.includes('[DONE]')) continue;
-                        if (!line.startsWith('data: ')) continue;
-                        
-                        try {
-                            const data = JSON.parse(line.slice(6));
-                            const content = data.choices[0].delta.content;
-                            if (content) {
-                                response += content;
-                                onChunk?.(content);
-                            }
-                        } catch (err) {
-                            debug('Error parsing chunk:', err);
-                        }
-                    }
-                });
-
-                res.on('end', () => {
-                    this.currentRequest = null;
-                    resolve(response);
-                });
-            });
-
-            this.currentRequest.on('error', error => {
-                this.currentRequest = null;
-                reject(error);
-            });
-
-            const requestData = {
-                model: this.model,
-                messages,
-                stream: true
-            };
-
-            this.currentRequest.write(JSON.stringify(requestData));
-            this.currentRequest.end();
-        });
-    }
-
-    abort() {
-        if (this.currentRequest) {
-            this.currentRequest.destroy();
-            this.currentRequest = null;
-        }
-    }
-}
-
-class REPLSession {
-    constructor(llmClient) {
-        this.llmClient = llmClient;
         this.files = new Set();
-        this.history = [];
+        this.conversation = [];
+        this.currentRequest = null;
         this.rl = readline.createInterface({
             input: process.stdin,
             output: process.stdout,
@@ -149,13 +39,11 @@ class REPLSession {
         });
     }
 
-    async start(initialFiles) {
-        initialFiles.forEach(f => this.files.add(f));
+    async start(initialFiles = []) {
+        initialFiles.forEach(file => this.files.add(file));
+        console.log(`${colors.cyan}AI Coder REPL${colors.reset}`);
+        console.log('Type /help for available commands');
         
-        console.log(`${colors.cyan}AI Coder REPL started. Type /help for commands.${colors.reset}\n`);
-        
-        this.rl.prompt();
-
         this.rl.on('line', async (line) => {
             line = line.trim();
             if (!line) {
@@ -163,150 +51,329 @@ class REPLSession {
                 return;
             }
 
-            if (line.startsWith('/')) {
-                await this.handleCommand(line);
+            try {
+                if (line.startsWith('/')) {
+                    await this.handleCommand(line);
+                } else {
+                    // Treat as chat with context
+                    await this.chat(line);
+                }
+            } catch (error) {
+                console.error(`${colors.red}Error:${colors.reset}`, error.message);
+            }
+            
+            this.rl.prompt();
+        });
+
+        // Handle Ctrl+C during LLM response
+        process.on('SIGINT', () => {
+            if (this.currentRequest) {
+                this.currentRequest.destroy();
+                this.currentRequest = null;
+                console.log('\nAborted current request');
+                this.rl.prompt();
             } else {
-                await this.handleQuery(line);
+                process.exit(0);
             }
         });
 
-        // Handle Ctrl+C
-        this.rl.on('SIGINT', () => {
-            this.llmClient.abort();
-            console.log('\nRequest aborted');
-            this.rl.prompt();
-        });
+        this.rl.prompt();
     }
 
     async handleCommand(cmd) {
-        const parts = cmd.split(' ');
-        const command = parts[0];
-        const args = parts.slice(1);
-
+        const [command, ...args] = cmd.slice(1).split(' ');
+        
         switch (command) {
-            case '/help':
-                displayHelpAndExit();
+            case 'help':
+                console.log(`
+Available commands:
+    /help           - Show this help
+    /files          - List current files in context
+    /add <file>     - Add file to context
+    /drop <file>    - Remove file from context
+    /commit <prompt>- Generate and commit changes
+    /run <command>  - Execute shell command
+    /clear          - Clear conversation history
+    /quit           - Exit REPL
+                `);
                 break;
 
-            case '/add':
-                if (args.length === 0) {
-                    console.log(`${colors.red}Error: File name required${colors.reset}`);
-                } else {
-                    args.forEach(file => this.files.add(file));
-                    console.log(`${colors.green}Added files: ${args.join(', ')}${colors.reset}`);
-                }
-                break;
-
-            case '/drop':
-                if (args.length === 0) {
-                    console.log(`${colors.red}Error: File name required${colors.reset}`);
-                } else {
-                    args.forEach(file => this.files.delete(file));
-                    console.log(`${colors.green}Removed files: ${args.join(', ')}${colors.reset}`);
-                }
-                break;
-
-            case '/files':
-                console.log(`${colors.cyan}Current files:${colors.reset}`);
+            case 'files':
+                console.log('Current files in context:');
                 for (const file of this.files) {
                     console.log(`  ${file}`);
                 }
                 break;
 
-            case '/run':
-                if (args.length === 0) {
-                    console.log(`${colors.red}Error: Command required${colors.reset}`);
-                } else {
-                    const cmd = args.join(' ');
-                    try {
-                        const { stdout, stderr } = await require('util').promisify(require('child_process').exec)(cmd);
-                        const output = stdout + stderr;
-                        console.log(output);
-                        this.history.push(`Command: ${cmd}\nOutput: ${output}`);
-                    } catch (err) {
-                        console.error(`${colors.red}Error executing command:${colors.reset}`, err);
-                    }
+            case 'add':
+                if (!args[0]) {
+                    console.log(`${colors.red}Error: File path required${colors.reset}`);
+                    break;
+                }
+                try {
+                    fs.accessSync(args[0], fs.constants.R_OK);
+                    this.files.add(args[0]);
+                    console.log(`Added ${args[0]} to context`);
+                } catch (err) {
+                    console.log(`${colors.red}Error: Cannot access file ${args[0]}${colors.reset}`);
                 }
                 break;
 
-            case '/commit':
-                await this.commitChanges();
+            case 'drop':
+                if (this.files.delete(args[0])) {
+                    console.log(`Removed ${args[0]} from context`);
+                } else {
+                    console.log(`${colors.red}File ${args[0]} was not in context${colors.reset}`);
+                }
                 break;
 
-            case '/exit':
-                console.log('Goodbye!');
+            case 'commit':
+                if (args.length === 0) {
+                    console.log(`${colors.red}Error: Commit message required${colors.reset}`);
+                    break;
+                }
+                await this.handleCommit(args.join(' '));
+                break;
+
+            case 'run':
+                if (args.length === 0) {
+                    console.log(`${colors.red}Error: Command required${colors.reset}`);
+                    break;
+                }
+                await this.runCommand(args.join(' '));
+                break;
+
+            case 'clear':
+                this.conversation = [];
+                console.log('Conversation history cleared');
+                break;
+
+            case 'quit':
                 process.exit(0);
                 break;
 
             default:
                 console.log(`${colors.red}Unknown command: ${command}${colors.reset}`);
         }
-
-        this.rl.prompt();
     }
 
-    async handleQuery(query) {
+    async chat(message) {
         const fileContents = Array.from(this.files).map(file => {
             try {
                 const content = fs.readFileSync(file, 'utf8');
                 return `${file}\n\`\`\`\n${content}\n\`\`\`\n`;
             } catch (err) {
-                console.error(`${colors.red}Error reading file ${file}: ${err.message}${colors.reset}`);
                 return '';
             }
         }).join('\n');
 
-        const historyContext = this.history.length > 0 ? 
-            '\nPrevious conversation:\n' + this.history.join('\n') : '';
+        const systemPrompt = `You are an expert developer helping to understand and modify code. 
+If you're asked to modify code, always show the complete file content with filename and content between \`\`\` marks.
+Never use ... or partial files. Include filename alone on a line. Be concise in explanations.`;
+
+        this.conversation.push({ role: 'user', content: message });
 
         const messages = [
-            { role: 'system', content: SYSTEM_PROMPT },
-            { role: 'user', content: `${query}\n\nFiles:\n${fileContents}${historyContext}` }
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: `Context files:\n${fileContents}\n\nRequest: ${message}` },
+            ...this.conversation
         ];
 
-        try {
-            const response = await this.llmClient.makeRequest(messages, 
-                chunk => process.stdout.write(chunk));
-            
-            this.history.push(`User: ${query}\nAssistant: ${response}`);
-            console.log('\n');
-        } catch (err) {
-            console.error(`${colors.red}Error:${colors.reset}`, err);
-        }
-
-        this.rl.prompt();
+        await this.streamLLMResponse(messages);
     }
 
-    async commitChanges() {
-        // Get git diff
-        const { stdout: diff } = await require('util').promisify(require('child_process').exec)('git diff HEAD');
-        
+    async handleCommit(prompt) {
+        // First, generate the changes
+        const fileContents = Array.from(this.files).map(file => {
+            try {
+                const content = fs.readFileSync(file, 'utf8');
+                return `${file}\n\`\`\`\n${content}\n\`\`\`\n`;
+            } catch (err) {
+                return '';
+            }
+        }).join('\n');
+
         const messages = [
-            { role: 'system', content: 'Generate a concise git commit message for these changes.' },
-            { role: 'user', content: `Changes:\n${diff}` }
+            {
+                role: 'system',
+                content: `You are an expert developer. Generate code changes based on the request.
+For each modified file, show the complete new content with filename on a line, followed by content between \`\`\` marks.
+Start with a very brief one-line summary of changes.`
+            },
+            {
+                role: 'user',
+                content: `Context files:\n${fileContents}\n\nRequested changes: ${prompt}`
+            }
         ];
 
-        try {
-            const commitMsg = await this.llmClient.makeRequest(messages);
-            
-            // Add files first
-            await require('util').promisify(require('child_process').exec)('git add .');
-            
-            // Create commit
-            const gitProcess = spawn('git', ['commit', '-F', '-']);
-            gitProcess.stdin.write(commitMsg);
-            gitProcess.stdin.end();
+        console.log(`${colors.cyan}Generating changes...${colors.reset}`);
+        const response = await this.streamLLMResponse(messages);
 
-            console.log(`${colors.green}Changes committed${colors.reset}`);
-        } catch (err) {
-            console.error(`${colors.red}Error committing changes:${colors.reset}`, err);
+        // Apply changes
+        const files = new Set();
+        let currentFile = null;
+        let content = '';
+        let isInCode = false;
+
+        for (const line of response.split('\n')) {
+            if (line.startsWith('```')) {
+                if (isInCode) {
+                    // End of code block
+                    if (currentFile) {
+                        fs.writeFileSync(currentFile, content.trimEnd());
+                        files.add(currentFile);
+                        content = '';
+                    }
+                }
+                isInCode = !isInCode;
+                continue;
+            }
+
+            if (isInCode) {
+                content += line + '\n';
+            } else if (line.trim() && !line.startsWith('```')) {
+                currentFile = line.trim();
+            }
         }
+
+        // Git operations
+        if (files.size > 0) {
+            // Add changed files
+            for (const file of files) {
+                await this.runCommand(`git add "${file}"`);
+            }
+
+            // Get diff for commit message
+            const diff = await new Promise((resolve) => {
+                const git = spawn('git', ['diff', '--cached']);
+                let output = '';
+                git.stdout.on('data', (data) => output += data);
+                git.stderr.on('data', (data) => console.error(data.toString()));
+                git.on('close', () => resolve(output));
+            });
+
+            // Generate commit message
+            const commitMessages = [
+                {
+                    role: 'system',
+                    content: 'Generate a concise git commit message (title and description) based on the changes and original request.'
+                },
+                {
+                    role: 'user',
+                    content: `Original request: ${prompt}\n\nChanges:\n${diff}`
+                }
+            ];
+
+            console.log(`${colors.cyan}Generating commit message...${colors.reset}`);
+            const commitMessage = await this.streamLLMResponse(commitMessages);
+
+            // Commit changes
+            const gitCommit = spawn('git', ['commit', '-F', '-']);
+            gitCommit.stdin.write(commitMessage);
+            gitCommit.stdin.end();
+
+            gitCommit.on('close', (code) => {
+                if (code === 0) {
+                    console.log(`${colors.green}Changes committed successfully${colors.reset}`);
+                } else {
+                    console.log(`${colors.red}Error committing changes${colors.reset}`);
+                }
+            });
+        }
+    }
+
+    async runCommand(command) {
+        return new Promise((resolve) => {
+            const proc = spawn(command, [], { shell: true });
+            
+            proc.stdout.on('data', (data) => {
+                process.stdout.write(data);
+            });
+            
+            proc.stderr.on('data', (data) => {
+                process.stderr.write(data);
+            });
+            
+            proc.on('close', (code) => {
+                this.conversation.push({
+                    role: 'user',
+                    content: `Executed command: ${command}\nExit code: ${code}`
+                });
+                resolve();
+            });
+        });
+    }
+
+    async streamLLMResponse(messages) {
+        return new Promise((resolve, reject) => {
+            const requestData = {
+                model: this.model,
+                messages: messages,
+                stream: true
+            };
+
+            const options = {
+                hostname: new URL(this.apiUrl).hostname,
+                path: new URL(this.apiUrl).pathname,
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${this.apiKey}`
+                }
+            };
+
+            let fullResponse = '';
+            this.currentRequest = https.request(options, (res) => {
+                res.on('data', (chunk) => {
+                    const lines = chunk.toString().split('\n');
+                    for (const line of lines) {
+                        if (line.trim() === '') continue;
+                        if (line.includes('[DONE]')) continue;
+                        
+                        try {
+                            const parsed = JSON.parse(line.replace(/^data: /, ''));
+                            const content = parsed.choices[0]?.delta?.content || '';
+                            if (content) {
+                                process.stdout.write(content);
+                                fullResponse += content;
+                            }
+                        } catch (e) {
+                            // Ignore parse errors from incomplete chunks
+                        }
+                    }
+                });
+
+                res.on('end', () => {
+                    this.currentRequest = null;
+                    this.conversation.push({ role: 'assistant', content: fullResponse });
+                    console.log('\n');
+                    resolve(fullResponse);
+                });
+            });
+
+            this.currentRequest.on('error', (error) => {
+                this.currentRequest = null;
+                reject(error);
+            });
+
+            this.currentRequest.write(JSON.stringify(requestData));
+            this.currentRequest.end();
+        });
     }
 }
 
 // Main
-if (process.argv.length < 3) {
-    displayHelpAndExit();
+if (process.argv.includes('--help') || process.argv.includes('-h')) {
+    console.log(`
+ai-coder [options] [file1] [file2] [fileN]
+  -k, --key <key>            API key (default: $OPENROUTER_API_KEY)
+  -u, --url <url>            API URL (default: ${API_URL})
+  -m, --model <model_name>   LLM model name (default: ${MODEL_NAME})
+  -h, --help                 Show this help
+
+Start REPL with optional initial files in context.
+    `);
+    process.exit(0);
 }
 
 const parsedArgs = require('minimist')(process.argv.slice(2), {
@@ -325,80 +392,10 @@ const parsedArgs = require('minimist')(process.argv.slice(2), {
     }
 });
 
-if (parsedArgs.help) {
-    displayHelpAndExit();
-}
-
 if (!parsedArgs.key) {
     console.error('API key is required. Set OPENROUTER_API_KEY env variable or use --key option.');
     process.exit(1);
 }
 
-const command = parsedArgs._[0];
-const files = parsedArgs._.slice(1);
-
-const llmClient = new LLMClient(parsedArgs.key, parsedArgs.url, parsedArgs.model);
-
-if (command === 'repl') {
-    const repl = new REPLSession(llmClient);
-    repl.start(files);
-} else if (!['ask', 'commit'].includes(command)) {
-    console.error(`Invalid command: ${command}`);
-    displayHelpAndExit();
-} else {
-    // Handle non-interactive commands
-    let userInput = '';
-    process.stdin.on('data', chunk => {
-        userInput += chunk;
-    });
-
-    process.stdin.on('end', async () => {
-        const fileContents = files.map(file => {
-            try {
-                const content = fs.readFileSync(file, 'utf8');
-                return `${file}\n\`\`\`\n${content}\n\`\`\`\n`;
-            } catch (err) {
-                console.error(`Error reading file ${file}: ${err.message}`);
-                return '';
-            }
-        }).join('\n');
-
-        const messages = [
-            { role: 'system', content: SYSTEM_PROMPT },
-            { role: 'user', content: `${userInput.trim()}\n\nFiles:\n${fileContents}` }
-        ];
-
-        try {
-            const response = await llmClient.makeRequest(messages, 
-                chunk => process.stdout.write(chunk));
-
-            if (command === 'commit') {
-                // Parse and apply file changes
-                const fileChanges = response.split(/\n(?=[\w-]+\.[a-zA-Z]+\n```)/);
-                for (const change of fileChanges) {
-                    const match = change.match(/^([\w-]+\.[a-zA-Z]+)\n```[^\n]*\n([\s\S]*?)\n```/);
-                    if (match) {
-                        const [, filename, content] = match;
-                        fs.writeFileSync(filename, content);
-                        await require('util').promisify(require('child_process').exec)(`git add "${filename}"`);
-                    }
-                }
-
-                // Generate and apply commit message
-                const { stdout: diff } = await require('util').promisify(require('child_process').exec)('git diff --cached');
-                const commitMessages = [
-                    { role: 'system', content: 'Generate a concise git commit message for these changes.' },
-                    { role: 'user', content: `Original request: ${userInput.trim()}\n\nChanges:\n${diff}` }
-                ];
-                
-                const commitMsg = await llmClient.makeRequest(commitMessages);
-                const gitProcess = spawn('git', ['commit', '-F', '-']);
-                gitProcess.stdin.write(commitMsg);
-                gitProcess.stdin.end();
-            }
-        } catch (err) {
-            console.error('Error:', err);
-            process.exit(1);
-        }
-    });
-}
+const coder = new Coder(parsedArgs.key, parsedArgs.url, parsedArgs.model);
+coder.start(parsedArgs._);

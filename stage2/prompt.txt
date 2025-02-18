@@ -3,17 +3,21 @@ Start response with very laconic one line overview of changes done.
 Let's think how to refactor coder to introduce new features:
 - REPL command
     - should take list of files like other commands, but also allow to add/drop them interactively
-    - use commands like /commit
-    - keep conversation history and include it in LLM request
-    - /run command should execute given command; include both command and output in chat history
+    - use commands like:
+        - /commit <prompt to generate change>
+        - /run <command to run using user's shell and include both command output in the chat history>
+        - /add, /files, /drop - manage files in context
+    - keep conversation history and include it in LLM request. Make sure to keep both users and assistant messages.
     - use colors (ansi codes directly, avoid chalk)
 - streaming LLM response
     - needs to abort the current request on Ctrl-C, don't crash whole program
     - beware of [DONE]
-    - don't accept new commands before receiving full response
+    - don't accept new commands (and/or display prompt) before receiving full response
+    - display response in terminal (including during commit)
 - don't use external files for prompt templates 
 - make sure that when commiting:
-    - first add files using `git add`
+    - generate changes using LLM and prompt after /commit command
+    - first add files using `git add`, make sure to only add changed/created fles
     - the changes are applied to correct files (filename parsed from response)
     - newly created files are supported
     - commit message generated (run another query with LLM, just feed it user prompt + `git diff HEAD`)
