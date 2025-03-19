@@ -20,7 +20,7 @@ process.stdin.on('end', async () => {
     const userPrompt = userPromptTemplate.replace('{{USER_REQUEST}}', userInput.trim());
 
     const requestData = {
-        model: 'anthropic/claude-3-sonnet',
+        model: 'anthropic/claude-3.7-sonnet',
         messages: [
             { role: 'system', content: systemPrompt },
             { role: 'user', content: userPrompt }
