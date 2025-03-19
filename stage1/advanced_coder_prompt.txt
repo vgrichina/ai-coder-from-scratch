@@ -53,6 +53,7 @@ Prompt files:
 - Make sure to use prompt files in the same __dirname as generated module.
 - Replace {{USER_REQUEST}} with prompt given in stdin
 - Replace {{FILES}} with full content (and names) of files being edited
+- Only rely on prompt files present in current context (system_prompt.txt, user_prompt.txt). Don't assume any extra .txt files gonna be provided.
 
 Git:
 

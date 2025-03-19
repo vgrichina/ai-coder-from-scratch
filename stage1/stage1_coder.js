@@ -1,21 +1,22 @@
 #!/usr/bin/env node
 
-let fs = require('fs');
-let path = require('path');
-let { spawnSync } = require('child_process');
-let https = require('https');
-let debug = require('debug')('ai-coder');
-let readline = require('readline');
+const fs = require('fs');
+const path = require('path');
+const https = require('https');
+const { exec } = require('child_process');
+const { URL } = require('url');
+const debug = require('debug')('ai-coder');
+
+// Default configurations
+let API_KEY = process.env.OPENROUTER_API_KEY || '';
+let API_URL = 'https://openrouter.ai/api/v1/chat/completions';
+let MODEL = 'anthropic/claude-3.5-sonnet';
 
 // Parse command line arguments
 let args = process.argv.slice(2);
-let options = {
-  key: process.env.OPENROUTER_API_KEY,
-  url: 'https://openrouter.ai/api/v1/chat/completions',
-  model: 'anthropic/claude-3.5-sonnet'
-};
+let command = null;
+let files = [];
 
-// Function to display help
 function showHelp() {
   console.log(`
 ai-coder [options] <command>
@@ -27,30 +28,33 @@ ai-coder [options] <command>
 Commands:
     ask [file1] [file2] [fileN]             Ask about code (just show LLM response). Files are provided to LLM as a context.
     commit [file1] [file2] [fileN]          Create git commit based on given prompt. Files are provided to LLM as a context and then edited.
-  `);
+`);
 }
 
-// Parse command line options
-let command = null;
-let files = [];
-
-for (let i = 0; i < args.length; i++) {
-  let arg = args[i];
+// Parse arguments
+while (args.length > 0) {
+  const arg = args.shift();
   
   if (arg === '-h' || arg === '--help') {
     showHelp();
     process.exit(0);
   } else if (arg === '-k' || arg === '--key') {
-    options.key = args[++i];
+    API_KEY = args.shift() || '';
   } else if (arg === '-u' || arg === '--url') {
-    options.url = args[++i];
+    API_URL = args.shift() || API_URL;
   } else if (arg === '-m' || arg === '--model') {
-    options.model = args[++i];
-  } else if (!command && ['ask', 'commit'].includes(arg)) {
+    MODEL = args.shift() || MODEL;
+  } else if (!command) {
     command = arg;
   } else {
     files.push(arg);
   }
+}
+
+// Check if API key is provided
+if (!API_KEY) {
+  console.error('Error: API key is required. Set OPENROUTER_API_KEY environment variable or use --key option.');
+  process.exit(1);
 }
 
 // If no command is provided, show help
@@ -59,226 +63,226 @@ if (!command) {
   process.exit(0);
 }
 
-// Validate API key
-if (!options.key) {
-  console.error('Error: No API key provided. Set OPENROUTER_API_KEY environment variable or use --key option');
-  process.exit(1);
-}
-
 // Read user input from stdin
 let userInput = '';
-let rl = readline.createInterface({
-  input: process.stdin,
-  output: process.stdout
+process.stdin.on('data', chunk => {
+  userInput += chunk;
 });
 
-// Handle input line by line
-let lines = [];
-rl.on('line', (line) => {
-  lines.push(line);
-});
-
-rl.on('close', async () => {
-  userInput = lines.join('\n');
-  
+process.stdin.on('end', async () => {
   try {
+    userInput = userInput.trim();
+    debug('User input received:', userInput);
+    
+    // Load prompt templates
+    let systemPrompt = fs.readFileSync(path.join(__dirname, 'system_prompt.txt'), 'utf8');
+    let userPrompt = fs.readFileSync(path.join(__dirname, 'user_prompt.txt'), 'utf8');
+    
+    // Read file contents
+    let filesContent = '';
+    if (files.length > 0) {
+      filesContent = await readFiles(files);
+    }
+    
+    // Replace placeholders in user prompt
+    userPrompt = userPrompt.replace('{{USER_REQUEST}}', userInput);
+    userPrompt = userPrompt.replace('{{FILES}}', filesContent);
+    
+    // Process the command
     if (command === 'ask') {
-      await handleAskCommand(userInput, files, options);
+      await askAboutCode(systemPrompt, userPrompt);
     } else if (command === 'commit') {
-      await handleCommitCommand(userInput, files, options);
+      await createCommit(systemPrompt, userPrompt, files, userInput);
+    } else {
+      console.error(`Unknown command: ${command}`);
+      showHelp();
+      process.exit(1);
     }
   } catch (error) {
-    console.error(`Error: ${error.message}`);
+    console.error('Error:', error.message);
     debug('Stack trace:', error.stack);
     process.exit(1);
   }
 });
 
-// Read file contents and prepare file context
-async function getFilesContext(files) {
-  let filesContext = '';
+// Read files and format their content for the prompt
+async function readFiles(fileList) {
+  let content = '';
   
-  for (let file of files) {
+  for (let file of fileList) {
     try {
       if (fs.existsSync(file)) {
-        let content = fs.readFileSync(file, 'utf8');
-        filesContext += `${file}\n\`\`\`\n${content}\n\`\`\`\n\n`;
+        let data = fs.readFileSync(file, 'utf8');
+        content += `${file}\n\`\`\`\n${data}\n\`\`\`\n\n`;
       } else {
         console.error(`Warning: File not found: ${file}`);
       }
     } catch (error) {
-      debug(`Error reading file ${file}:`, error);
-      throw new Error(`Failed to read file ${file}: ${error.message}`);
+      console.error(`Error reading file ${file}:`, error.message);
     }
   }
   
-  return filesContext;
+  return content.trim();
 }
 
-// Make API request to LLM
-async function callLLM(options, messages) {
+// Make API request to the LLM
+function callLLM(systemPrompt, userPrompt) {
   return new Promise((resolve, reject) => {
-    let urlObj = new URL(options.url);
-    
-    debug('Sending request to LLM:', JSON.stringify(messages, null, 2));
-    
-    let requestData = JSON.stringify({
-      model: options.model,
-      messages: messages,
-      stream: false
-    });
-    
-    let apiRequest = {
-      hostname: urlObj.hostname,
-      path: urlObj.pathname + urlObj.search,
-      port: urlObj.port || 443,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(requestData),
-        'Authorization': `Bearer ${options.key}`
-      }
-    };
-    
-    let req = https.request(apiRequest, (res) => {
-      let data = '';
+    try {
+      const requestData = {
+        model: MODEL,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt }
+        ],
+        stream: false
+      };
       
-      res.on('data', (chunk) => {
-        data += chunk;
-      });
+      debug('Sending request to LLM API:', JSON.stringify(requestData, null, 2));
       
-      res.on('end', () => {
-        if (res.statusCode !== 200) {
-          debug('Error response from API:', data);
-          reject(new Error(`API request failed with status ${res.statusCode}: ${data}`));
-          return;
+      // Parse API URL
+      const parsedUrl = new URL(API_URL);
+      
+      const options = {
+        hostname: parsedUrl.hostname,
+        path: parsedUrl.pathname + parsedUrl.search,
+        method: 'POST',
+        port: parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80),
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${API_KEY}`
         }
+      };
+      
+      debug('API request options:', JSON.stringify(options));
+      
+      const req = https.request(options, (res) => {
+        let data = '';
         
-        try {
-          let response = JSON.parse(data);
-          debug('Received response from LLM:', JSON.stringify(response, null, 2));
-          resolve(response);
-        } catch (error) {
-          debug('Error parsing response:', error);
-          reject(new Error(`Failed to parse LLM response: ${error.message}`));
-        }
+        res.on('data', (chunk) => {
+          data += chunk;
+        });
+        
+        res.on('end', () => {
+          try {
+            debug('Response received from LLM API:', data);
+            
+            if (res.statusCode >= 200 && res.statusCode < 300) {
+              const response = JSON.parse(data);
+              const content = response.choices[0].message.content;
+              resolve(content);
+            } else {
+              reject(new Error(`API request failed with status ${res.statusCode}: ${data}`));
+            }
+          } catch (error) {
+            reject(new Error(`Failed to parse API response: ${error.message}`));
+          }
+        });
       });
-    });
-    
-    req.on('error', (error) => {
-      debug('Request error:', error);
-      reject(new Error(`API request failed: ${error.message}`));
-    });
-    
-    req.write(requestData);
-    req.end();
+      
+      req.on('error', (error) => {
+        reject(new Error(`Network error: ${error.message}`));
+      });
+      
+      req.write(JSON.stringify(requestData));
+      req.end();
+      
+    } catch (error) {
+      reject(new Error(`Error setting up API request: ${error.message}`));
+    }
   });
 }
 
-// Handle the ask command
-async function handleAskCommand(prompt, files, options) {
-  // Load prompt templates
-  let systemPrompt = fs.readFileSync(path.join(__dirname, 'system_prompt.txt'), 'utf8');
-  let userPromptTemplate = fs.readFileSync(path.join(__dirname, 'ask_prompt.txt'), 'utf8');
-  
-  // Get file contents
-  let filesContext = await getFilesContext(files);
-  
-  // Prepare messages
-  let userPrompt = userPromptTemplate
-    .replace('{{USER_REQUEST}}', prompt)
-    .replace('{{FILES}}', filesContext);
-  
-  let messages = [
-    { role: 'system', content: systemPrompt },
-    { role: 'user', content: userPrompt }
-  ];
-  
-  // Make API request
-  let response = await callLLM(options, messages);
-  
-  // Display the response
-  console.log(response.choices[0].message.content);
+// Ask about code and display the response
+async function askAboutCode(systemPrompt, userPrompt) {
+  try {
+    const response = await callLLM(systemPrompt, userPrompt);
+    console.log(response);
+  } catch (error) {
+    console.error('Error asking about code:', error.message);
+    debug('Stack trace:', error.stack);
+  }
 }
 
-// Handle the commit command
-async function handleCommitCommand(prompt, files, options) {
-  // First, generate code changes
-  let systemPrompt = fs.readFileSync(path.join(__dirname, 'system_prompt.txt'), 'utf8');
-  let userPromptTemplate = fs.readFileSync(path.join(__dirname, 'commit_prompt.txt'), 'utf8');
-  
-  // Get file contents
-  let filesContext = await getFilesContext(files);
-  
-  // Prepare messages for code changes
-  let userPrompt = userPromptTemplate
-    .replace('{{USER_REQUEST}}', prompt)
-    .replace('{{FILES}}', filesContext);
-  
-  let messages = [
-    { role: 'system', content: systemPrompt },
-    { role: 'user', content: userPrompt }
-  ];
-  
-  // Get code changes
-  let response = await callLLM(options, messages);
-  let content = response.choices[0].message.content;
-  
-  // Extract file changes
-  let fileRegex = /^(.+?)\n```\n([\s\S]+?)\n```/gm;
-  let match;
-  let fileChanges = [];
-  
-  while ((match = fileRegex.exec(content)) !== null) {
-    fileChanges.push({
-      filename: match[1].trim(),
-      content: match[2]
-    });
-  }
-  
-  // Apply file changes
-  for (let change of fileChanges) {
-    try {
-      debug(`Writing file: ${change.filename}`);
-      fs.writeFileSync(change.filename, change.content, 'utf8');
-      console.log(`Updated: ${change.filename}`);
-    } catch (error) {
-      debug(`Error writing file ${change.filename}:`, error);
-      throw new Error(`Failed to update file ${change.filename}: ${error.message}`);
-    }
-  }
-  
-  // Generate commit message
-  let summaryPromptTemplate = fs.readFileSync(path.join(__dirname, 'summary_prompt.txt'), 'utf8');
-  let summaryPrompt = summaryPromptTemplate
-    .replace('{{USER_REQUEST}}', prompt)
-    .replace('{{FILES}}', filesContext);
-  
-  let summaryMessages = [
-    { role: 'system', content: "You are a helpful assistant that creates concise git commit messages." },
-    { role: 'user', content: summaryPrompt }
-  ];
-  
-  let summaryResponse = await callLLM(options, summaryMessages);
-  let summary = summaryResponse.choices[0].message.content.trim();
-  
-  // Format full commit message
-  let commitMessage = `${summary}\n\nOriginal prompt:\n\n${prompt}`;
-  
-  // Commit the changes
+// Generate commit message from LLM response
+async function generateCommitMessage(userPrompt) {
   try {
-    let gitResult = spawnSync('git', ['commit', '-a', '-F', '-'], {
-      input: commitMessage,
-      encoding: 'utf8'
-    });
+    // Simple system prompt for commit message generation
+    let commitSystemPrompt = 'Generate a concise and descriptive git commit message based on the changes described. Keep it under 50 characters.';
     
-    if (gitResult.status === 0) {
-      console.log('Successfully committed changes');
-    } else {
-      console.error('Failed to commit changes:', gitResult.stderr);
-    }
+    const response = await callLLM(commitSystemPrompt, `Summarize these changes in a git commit message:\n${userPrompt}`);
+    return response.trim();
   } catch (error) {
-    debug('Git error:', error);
-    throw new Error(`Failed to execute git command: ${error.message}`);
+    console.error('Error generating commit message:', error.message);
+    return 'Changes from AI-coder';
+  }
+}
+
+// Parse and update files from LLM response
+function parseAndUpdateFiles(response, files) {
+  const fileUpdates = [];
+  
+  // Regular expression to find files in the response
+  const filePattern = /(.*?)\n```\n([\s\S]*?)\n```/g;
+  let match;
+  
+  while ((match = filePattern.exec(response)) !== null) {
+    let filename = match[1].trim();
+    let content = match[2];
+    
+    // Only update files that were provided in the input
+    if (files.includes(filename)) {
+      fileUpdates.push({ filename, content });
+    } else {
+      console.warn(`Warning: File ${filename} was not in the input list and will not be updated.`);
+    }
+  }
+  
+  return fileUpdates;
+}
+
+// Create git commit based on LLM response
+async function createCommit(systemPrompt, userPrompt, files, originalPrompt) {
+  try {
+    // Get response from LLM
+    const response = await callLLM(systemPrompt, userPrompt);
+    console.log("LLM Response:");
+    console.log(response);
+    
+    // Parse file updates from response
+    const fileUpdates = parseAndUpdateFiles(response, files);
+    
+    if (fileUpdates.length === 0) {
+      console.error('No valid file updates found in the response');
+      return;
+    }
+    
+    // Update files
+    for (let update of fileUpdates) {
+      fs.writeFileSync(update.filename, update.content, 'utf8');
+      console.log(`Updated ${update.filename}`);
+    }
+    
+    // Generate commit message
+    const summary = await generateCommitMessage(originalPrompt);
+    
+    // Format full commit message
+    const commitMessage = `${summary}\n\nOriginal prompt:\n\n${originalPrompt}`;
+    
+    // Create git commit
+    exec('git commit -a -F -', (error, stdout, stderr) => {
+      if (error) {
+        console.error(`Error creating git commit: ${error.message}`);
+        debug('Git error details:', stderr);
+        return;
+      }
+      
+      console.log('Git commit created successfully:');
+      console.log(stdout);
+    }).stdin.end(commitMessage);
+    
+  } catch (error) {
+    console.error('Error creating commit:', error.message);
+    debug('Stack trace:', error.stack);
   }
 }
